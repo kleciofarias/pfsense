@@ -18,7 +18,7 @@ Search foi package
 
 # pkg search ^openjdk
 
-Afeter install package disable repo and file modified
+After install package disable repo and file modified
 
 
 
