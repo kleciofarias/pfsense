@@ -12,7 +12,7 @@ Next edit file /usr/local/etc/pkg/repos/FreeBSD.con e change:
 
  FreeBSD: { enabled: yes }
 
-# pgg update
+# pgk update
 
 Search foi package 
 
