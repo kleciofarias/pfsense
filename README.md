@@ -1,10 +1,10 @@
-**# 🔄 pfsense2opnsense
+ pfsense2opnsense
 
-Converte o backup `config.xml` do **pfSense** para o formato compatível com **OPNsense**, incluindo suporte completo ao **Dnsmasq DNS & DHCP**.
+Converte o backup `config.xml` do pfSense para o formato compatível com OPNsense.
 
 ---
 
-## ✨ O que ele migra
+ ✨ O que ele migra
 
 | # | Item | Detalhes |
 |---|------|----------|
@@ -23,7 +23,7 @@ Converte o backup `config.xml` do **pfSense** para o formato compatível com **O
 
 ---
 
-## 📋 Pré-requisitos
+ 📋 Pré-requisitos
 
 - Python 3.8+
 - Biblioteca `bcrypt` (necessária para criar novo usuário com senha)
