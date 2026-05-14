@@ -1,595 +1,334 @@
-#!/usr/bin/env python3
-"""
-pfsense2opnsense.py
-Converte backup config.xml do pfSense para OPNsense com Dnsmasq DNS & DHCP.
-
-Uso:
-  python3 pfsense2opnsense.py -i config-pfSense.xml
-  python3 pfsense2opnsense.py -i config-pfSense.xml -o config-opnsense.xml --new-user
-  python3 pfsense2opnsense.py -i config-pfSense.xml --new-user \
-      --username joao --password minhasenha --fullname "João Silva"
-"""
-
-import argparse
-import getpass
-import ipaddress
-import sys
-import uuid
-import xml.etree.ElementTree as ET
-
-try:
-    import bcrypt
-    HAS_BCRYPT = True
-except ImportError:
-    HAS_BCRYPT = False
-
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-def tx(el, tag, default=''):
-    if el is None:
-        return default
-    v = el.findtext(tag, default)
-    return v.strip() if v else default
-
-def u():
-    return str(uuid.uuid4())
-
-def se(parent, tag, text=None):
-    el = ET.SubElement(parent, tag)
-    if text is not None:
-        el.text = text
-    return el
-
-def empty(parent, tag):
-    ET.SubElement(parent, tag)
-
-def hash_password(password):
-    if HAS_BCRYPT:
-        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt(rounds=10))
-        return hashed.decode()
-    else:
-        print("[AVISO] Módulo 'bcrypt' não encontrado. Instale com: pip install bcrypt")
-        print("        A senha do novo usuário precisará ser redefinida manualmente.")
-        return ''
-
-def prompt_new_user(args):
-    print("\n── Criação de novo usuário admin ──────────────────────────────")
-    username = args.username or input("  Nome de usuário [admin2]: ").strip() or 'admin2'
-    fullname = args.fullname or input(f"  Nome completo [{username}]: ").strip() or username
-    password = args.password
-    if not password:
-        while True:
-            password = getpass.getpass("  Senha: ")
-            confirm  = getpass.getpass("  Confirme a senha: ")
-            if password == confirm:
-                break
-            print("  Senhas não conferem, tente novamente.")
-    return username, fullname, password
-
-
-# ── conversão ─────────────────────────────────────────────────────────────────
-
-def convert(src, dst, create_user=False, args=None):
-    pf       = ET.parse(src).getroot()
-    sys_pf   = pf.find('system')
-    domain   = tx(sys_pf, 'domain', 'home.arpa')
-    dns_list = [d.text.strip() for d in pf.findall('./system/dnsserver')
-                if d.text and d.text.strip()]
-
-    # coleta de dados para o relatório
-    report = {
-        'hostname':    tx(sys_pf, 'hostname', 'opnsense'),
-        'domain':      domain,
-        'timezone':    tx(sys_pf, 'timezone', ''),
-        'dns':         dns_list,
-        'interfaces':  [],
-        'routes':      [],
-        'gateways':    [],
-        'dhcp_ranges': [],
-        'reservas':    [],
-        'aliases':     [],
-        'fw_rules':    [],
-        'nat_rules':   [],
-        'vlans':       [],
-        'new_user':    None,
-        'not_migrated': [],
-    }
-
-    opn = ET.Element('opnsense')
-
-    # ── system ────────────────────────────────────────────────────────────────
-    sys_el = se(opn, 'system')
-    se(sys_el, 'optimization', 'normal')
-    se(sys_el, 'hostname', report['hostname'])
-    se(sys_el, 'domain',   domain)
-    se(sys_el, 'timezone', tx(sys_pf, 'timezone', 'America/Sao_Paulo'))
-    for ip in dns_list:
-        se(sys_el, 'dnsserver', ip)
-    se(sys_el, 'dnsallowoverride', '1')
-    se(sys_el, 'nextuid', '2000')
-    se(sys_el, 'nextgid', '2000')
-    se(sys_el, 'timeservers', tx(sys_pf, 'timeservers', '0.opnsense.pool.ntp.org'))
-
-    # root user
-    pf_user   = pf.find('./system/user')
-    root_user = se(sys_el, 'user')
-    se(root_user, 'name',      'root')
-    se(root_user, 'descr',     'System Administrator')
-    se(root_user, 'scope',     'system')
-    se(root_user, 'groupname', 'admins')
-    se(root_user, 'uid',       '0')
-    if pf_user is not None:
-        h = tx(pf_user, 'bcrypt-hash')
-        if h:
-            se(root_user, 'password', h.replace('$2y$', '$2b$'))
-    se(root_user, 'shell', '/bin/sh')
-
-    # novo usuário (opcional)
-    new_user_info = None
-    if create_user:
-        username, fullname, password = prompt_new_user(args)
-        pw_hash       = hash_password(password)
-        new_user_info = (username, fullname, pw_hash)
-        report['new_user'] = (username, fullname)
-
-        nu = se(sys_el, 'user')
-        se(nu, 'name',      username)
-        se(nu, 'descr',     fullname)
-        se(nu, 'scope',     'system')
-        se(nu, 'groupname', 'admins')
-        se(nu, 'uid',       '2000')
-        if pw_hash:
-            se(nu, 'password', pw_hash)
-        se(nu, 'priv',  'page-all')
-        se(nu, 'shell', '/bin/sh')
-        sys_el.find('nextuid').text = '2001'
-
-    grp = se(sys_el, 'group')
-    se(grp, 'name',        'admins')
-    se(grp, 'description', 'System Administrators')
-    se(grp, 'scope',       'system')
-    se(grp, 'gid',         '1999')
-    se(grp, 'member',      '0')
-    if new_user_info:
-        se(grp, 'member', '2000')
-    se(grp, 'priv', 'page-all')
-
-    wg = se(sys_el, 'webgui')
-    se(wg, 'protocol', 'https')
-    se(wg, 'port',     '443')
-    se(sys_el, 'serialspeed',          '115200')
-    se(sys_el, 'primaryconsole',       'video')
-    se(sys_el, 'disablenatreflection', 'yes')
-
-    # ── interfaces ────────────────────────────────────────────────────────────
-    ifaces_el      = se(opn, 'interfaces')
-    pf_ifaces      = pf.find('./interfaces')
-    lan_iface_name = 'lan'
-    if pf_ifaces is not None:
-        for iface in pf_ifaces:
-            name   = iface.tag.lower()
-            phys   = tx(iface, 'if')
-            ipaddr = tx(iface, 'ipaddr')
-            prefix = tx(iface, 'subnet')
-            descr  = tx(iface, 'descr') or name.upper()
-
-            if ipaddr and ipaddr != 'dhcp' and lan_iface_name == 'lan':
-                lan_iface_name = name
-
-            opn_if = se(ifaces_el, name)
-            se(opn_if, 'enable')
-            se(opn_if, 'if', phys)
-            se(opn_if, 'descr', descr)
-            if ipaddr == 'dhcp':
-                se(opn_if, 'ipaddr', 'dhcp')
-                report['interfaces'].append(f'{name} ({phys}) — DHCP')
-            elif ipaddr:
-                se(opn_if, 'ipaddr', ipaddr)
-                if prefix:
-                    se(opn_if, 'subnet', prefix)
-                report['interfaces'].append(f'{name} ({phys}) — {ipaddr}/{prefix}  [{descr}]')
-            else:
-                report['interfaces'].append(f'{name} ({phys}) — sem IP  [{descr}]')
-
-            ipaddrv6 = tx(iface, 'ipaddrv6')
-            if ipaddrv6:
-                se(opn_if, 'ipaddrv6', ipaddrv6)
-            if name == 'wan':
-                se(opn_if, 'blockpriv',   '1')
-                se(opn_if, 'blockbogons', '1')
-
-    # ── rotas estáticas ───────────────────────────────────────────────────────
-    sroutes = None
-    for r in pf.findall('./staticroutes/route'):
-        net = tx(r, 'network')
-        gw  = tx(r, 'gateway')
-        dsc = tx(r, 'descr')
-        if not (net and gw):
-            continue
-        if sroutes is None:
-            sroutes = se(opn, 'staticroutes')
-        sr = se(sroutes, 'route')
-        se(sr, 'network', net)
-        se(sr, 'gateway', gw)
-        if dsc:
-            se(sr, 'descr', dsc)
-        report['routes'].append(f'{net} via {gw}' + (f'  [{dsc}]' if dsc else ''))
-
-    # ── gateways ──────────────────────────────────────────────────────────────
-    gws_el = se(opn, 'gateways')
-    for gw in pf.findall('./gateways/gateway_item'):
-        name = tx(gw, 'name')
-        if not name:
-            continue
-        g = se(gws_el, 'gateway_item')
-        for tag in ('interface','gateway','name','weight','ipprotocol','descr','defaultgw'):
-            v = tx(gw, tag)
-            if v:
-                se(g, tag, v)
-        report['gateways'].append(f'{name} — {tx(gw,"gateway")} via {tx(gw,"interface")}')
-
-    # ── Dnsmasq DNS & DHCP ────────────────────────────────────────────────────
-    pf_dhcpd = pf.find('./dhcpd')
-
-    dm = se(opn, 'dnsmasq')
-    dm.set('version',     '1.0.8')
-    dm.set('description', 'Dnsmasq DNS and DHCP')
-
-    se(dm, 'enable',             '1')
-    se(dm, 'regdhcp',            '0')
-    se(dm, 'regdhcpstatic',      '1')
-    se(dm, 'dhcpfirst',          '0')
-    se(dm, 'strict_order',       '0')
-    se(dm, 'domain_needed',      '0')
-    se(dm, 'no_private_reverse', '0')
-    se(dm, 'no_resolv',          '0')
-    se(dm, 'log_queries',        '0')
-    se(dm, 'no_hosts',           '0')
-    se(dm, 'strictbind',         '0')
-    se(dm, 'dnssec',             '0')
-    empty(dm, 'regdhcpdomain')
-    se(dm, 'interface', lan_iface_name)
-    empty(dm, 'port')
-    empty(dm, 'dns_forward_max')
-    empty(dm, 'cache_size')
-    empty(dm, 'local_ttl')
-    empty(dm, 'add_mac')
-    se(dm, 'add_subnet',   '0')
-    se(dm, 'strip_subnet', '0')
-
-    dhcp_gen = se(dm, 'dhcp')
-    empty(dhcp_gen, 'no_interface')
-    se(dhcp_gen, 'fqdn',             '1')
-    se(dhcp_gen, 'domain',           domain)
-    se(dhcp_gen, 'local',            '1')
-    empty(dhcp_gen, 'lease_max')
-    se(dhcp_gen, 'authoritative',    '0')
-    se(dhcp_gen, 'default_fw_rules', '1')
-    empty(dhcp_gen, 'reply_delay')
-    se(dhcp_gen, 'enable_ra',        '0')
-    se(dhcp_gen, 'nosync',           '0')
-    se(dhcp_gen, 'log_dhcp',         '0')
-    se(dhcp_gen, 'log_quiet',        '0')
-    se(dm, 'no_ident', '1')
-
-    # reservas
-    if pf_dhcpd is not None:
-        for pf_iface_el in pf_dhcpd:
-            for sm in pf_iface_el.findall('staticmap'):
-                mac      = tx(sm, 'mac')
-                ip       = tx(sm, 'ipaddr')
-                hostname = tx(sm, 'hostname')
-                descr    = tx(sm, 'descr')
-                if not mac or not ip:
-                    continue
-                h = se(dm, 'hosts')
-                h.set('uuid', u())
-                se(h, 'host',       hostname or '')
-                se(h, 'domain',     domain)
-                se(h, 'local',      '0')
-                se(h, 'ip',         ip)
-                empty(h, 'cnames')
-                empty(h, 'client_id')
-                se(h, 'hwaddr',     mac)
-                empty(h, 'lease_time')
-                se(h, 'ignore',     '0')
-                empty(h, 'set_tag')
-                se(h, 'descr',      descr)
-                empty(h, 'comments')
-                empty(h, 'aliases')
-                label = f'{mac} → {ip}'
-                if hostname: label += f'  hostname: {hostname}'
-                if descr:    label += f'  [{descr}]'
-                report['reservas'].append(label)
-
-    # ranges
-    if pf_dhcpd is not None:
-        for pf_iface_el in pf_dhcpd:
-            iface_name = pf_iface_el.tag.lower()
-            range_el   = pf_iface_el.find('range')
-            if range_el is None:
-                continue
-            r_from = tx(range_el, 'from')
-            r_to   = tx(range_el, 'to')
-            if not (r_from and r_to):
-                continue
-            dr = se(dm, 'dhcp_ranges')
-            dr.set('uuid', u())
-            se(dr, 'interface',   iface_name)
-            empty(dr, 'set_tag')
-            se(dr, 'start_addr',  r_from)
-            se(dr, 'end_addr',    r_to)
-            empty(dr, 'subnet_mask')
-            empty(dr, 'constructor')
-            empty(dr, 'mode')
-            empty(dr, 'prefix_len')
-            empty(dr, 'lease_time')
-            se(dr, 'domain_type', 'range')
-            se(dr, 'domain',      domain)
-            se(dr, 'nosync',      '0')
-            empty(dr, 'ra_mode')
-            empty(dr, 'ra_priority')
-            empty(dr, 'ra_mtu')
-            empty(dr, 'ra_interval')
-            empty(dr, 'ra_router_lifetime')
-            empty(dr, 'description')
-            report['dhcp_ranges'].append(f'{iface_name}: {r_from} – {r_to}')
-
-    # ── VLANs ────────────────────────────────────────────────────────────────
-    pf_vlans = pf.findall('./vlans/vlan')
-    vlans_el = se(opn, 'vlans')
-    vlans_el.set('version', '1.0.0')
-    for vlan in pf_vlans:
-        parent_if = tx(vlan, 'if')
-        tag       = tx(vlan, 'tag')
-        descr     = tx(vlan, 'descr')
-        pcp       = tx(vlan, 'pcp', '0')
-        if not parent_if or not tag:
-            continue
-        vlanif = f'{parent_if}.{tag}'
-        v = se(vlans_el, 'vlan')
-        se(v, 'if',     parent_if)
-        se(v, 'tag',    tag)
-        se(v, 'pcp',    pcp)
-        se(v, 'descr',  descr)
-        se(v, 'vlanif', vlanif)
-        report['vlans'].append(f'{vlanif}  tag={tag}' + (f'  [{descr}]' if descr else ''))
-
-        # adiciona interface lógica para cada VLAN
-        vlan_iface = se(ifaces_el, vlanif.replace('.', '_'))
-        se(vlan_iface, 'if',    vlanif)
-        se(vlan_iface, 'descr', descr or f'VLAN {tag}')
-
-    # ── aliases ───────────────────────────────────────────────────────────────
-
-    pf_aliases = pf.findall('./aliases/alias')
-    if pf_aliases:
-        aliases_el = se(opn, 'aliases')
-        for a in pf_aliases:
-            name = tx(a, 'name')
-            if not name:
-                continue
-            al = se(aliases_el, 'alias')
-            se(al, 'name', name)
-            se(al, 'type', tx(a, 'type'))
-            addr = tx(a, 'address')
-            if addr:
-                se(al, 'content', addr.strip())
-            descr = tx(a, 'descr')
-            if descr:
-                se(al, 'descr', descr)
-            atype = tx(a, 'type')
-            report['aliases'].append(f'{name} ({atype})' + (f'  [{descr}]' if descr else ''))
-
-    # ── firewall ──────────────────────────────────────────────────────────────
-    pf_rules = pf.findall('./filter/rule')
-    if pf_rules:
-        filter_el = se(opn, 'filter')
-        for r in pf_rules:
-            if tx(r, 'associated-rule-id'):
-                continue
-            rule = se(filter_el, 'rule')
-            rtype = tx(r, 'type', 'pass')
-            iface = tx(r, 'interface')
-            proto = tx(r, 'protocol')
-            descr = tx(r, 'descr')
-            se(rule, 'type', rtype)
-            if iface: se(rule, 'interface', iface)
-            if proto: se(rule, 'protocol', proto)
-            for side in ('source', 'destination'):
-                side_el = r.find(side)
-                if side_el is None:
-                    continue
-                out = se(rule, side)
-                if side_el.find('any') is not None:
-                    se(out, 'any')
-                else:
-                    net  = tx(side_el, 'network')
-                    addr = tx(side_el, 'address')
-                    port = tx(side_el, 'port')
-                    if net:    se(out, 'network', net)
-                    elif addr: se(out, 'address', addr)
-                    if port:   se(out, 'port', port)
-            if descr: se(rule, 'descr', descr)
-            se(rule, 'enabled', '1')
-            label = f'[{rtype.upper()}] iface={iface}'
-            if proto: label += f' proto={proto}'
-            if descr: label += f'  "{descr}"'
-            report['fw_rules'].append(label)
-
-    # ── NAT ───────────────────────────────────────────────────────────────────
-    pf_nat = pf.findall('./nat/rule')
-    if pf_nat:
-        nat_el = se(opn, 'nat')
-        for r in pf_nat:
-            nr = se(nat_el, 'rule')
-            descr = tx(r, 'descr')
-            for tag in ('interface','protocol','target','local-port','descr'):
-                v = tx(r, tag)
-                if v: se(nr, tag, v)
-            for side in ('source', 'destination'):
-                side_el = r.find(side)
-                if side_el is not None:
-                    out = se(nr, side)
-                    if side_el.find('any') is not None:
-                        se(out, 'any')
-                    else:
-                        for sub in ('address','port','network'):
-                            v = tx(side_el, sub)
-                            if v: se(out, sub, v)
-            report['nat_rules'].append(descr or f'NAT {tx(r,"interface")}')
-
-    # itens não migrados
-    checks = [
-        ('./openvpn/openvpn-server', 'OpenVPN servidor'),
-        ('./openvpn/openvpn-client', 'OpenVPN cliente'),
-        ('./ipsec/phase1',       'IPsec'),
-        ('./cert',               'Certificados SSL'),
-        ('./captiveportal',      'Captive Portal'),
-    ]
-    for xpath, label in checks:
-        els = pf.findall(xpath)
-        if els and any(len(list(e)) > 0 or e.text for e in els):
-            report['not_migrated'].append(label)
-
-    # ── write XML ─────────────────────────────────────────────────────────────
-    ET.indent(opn, space='  ')
-    with open(dst, 'w', encoding='utf-8') as f:
-        f.write('<?xml version="1.0"?>\n')
-        ET.ElementTree(opn).write(f, encoding='unicode', xml_declaration=False)
-
-    return report
-
-
-# ── relatório ─────────────────────────────────────────────────────────────────
-
-def print_report(report, dst):
-    SEP  = '─' * 62
-    SEP2 = '═' * 62
-
-    print(f'\n{SEP2}')
-    print(f'  🔄  RELATÓRIO DE MIGRAÇÃO  pfSense → OPNsense')
-    print(f'{SEP2}')
-
-    print(f'\n  📄 Arquivo gerado : {dst}')
-
-    print(f'\n{SEP}')
-    print(f'  🖥️  SISTEMA')
-    print(f'{SEP}')
-    print(f'  🏷️  Hostname  : {report["hostname"]}')
-    print(f'  🌐 Domínio   : {report["domain"]}')
-    print(f'  🕐 Timezone  : {report["timezone"]}')
-    print(f'  🔍 DNS       : {", ".join(report["dns"]) or "nenhum"}')
-
-    if report['new_user']:
-        u, fn = report['new_user']
-        print(f'\n{SEP}')
-        print(f'  👤 NOVO USUÁRIO ADMIN')
-        print(f'{SEP}')
-        print(f'  👤 Usuário   : {u}')
-        print(f'  📝 Nome      : {fn}')
-        print(f'  🔑 Grupo     : admins (acesso total ao WebConfigurator)')
-
-    def section(icon, title, items, empty_msg='nenhum'):
-        print(f'\n{SEP}')
-        print(f'  {icon} {title}  ({len(items)})')
-        print(f'{SEP}')
-        if items:
-            for item in items:
-                print(f'  ✅ {item}')
-        else:
-            print(f'  ➖ {empty_msg}')
-
-    section('🔌', 'INTERFACES',         report['interfaces'])
-    section('🏮', 'VLANs',              report['vlans'],        'nenhuma')
-    section('🗺️ ', 'ROTAS ESTÁTICAS',   report['routes'],       'nenhuma')
-    section('🚪', 'GATEWAYS',           report['gateways'],     'nenhum')
-    section('📡', 'DHCP RANGES',        report['dhcp_ranges'],  'nenhum')
-    section('📋', 'RESERVAS DHCP',      report['reservas'],     'nenhuma')
-    section('🏷️ ', 'ALIASES',           report['aliases'],      'nenhum')
-    section('🛡️ ', 'REGRAS DE FIREWALL',report['fw_rules'],     'nenhuma')
-    section('🔀', 'REGRAS NAT',         report['nat_rules'],    'nenhuma')
-
-    if report['not_migrated']:
-        print(f'\n{SEP}')
-        print(f'  ⚠️  NÃO MIGRADO (configurar manualmente no OPNsense)')
-        print(f'{SEP}')
-        for item in report['not_migrated']:
-            print(f'  ⚠️  {item}')
-
-    print(f'\n{SEP2}')
-    print(f'  📥 COMO IMPORTAR NO OPNSENSE')
-    print(f'{SEP2}')
-    print(f"""
-  1️⃣  Acesse o OPNsense pelo navegador
-       🌐 https://<ip-do-opnsense>
-
-  2️⃣  Faça login
-       👤 Usuário: root (senha original do pfSense)
-
-  3️⃣  No menu superior vá em:
-       ⚙️  System → Configuration → Backups
-
-  4️⃣  Na seção "Restore", clique em "Browse" e selecione:
-       📄 {dst}
-
-  5️⃣  Clique em "Restore configuration" e confirme.
-
-  6️⃣  O OPNsense vai reiniciar automaticamente. 🔄
-
-  7️⃣  Após reiniciar, verifique cada serviço:
-       🔌 Interfaces  → Interfaces → Overview
-       📡 DHCP ranges → Services → Dnsmasq DNS & DHCP → DHCP ranges
-       📋 Reservas    → Services → Dnsmasq DNS & DHCP → Hosts
-       🛡️  Firewall    → Firewall → Rules
-       🏷️  Aliases     → Firewall → Aliases
-       🗺️  Rotas       → System → Routes → Configuration
-       🚪 Gateways    → System → Gateways → Single""")
-
-    if report['new_user']:
-        print(f"""
-  8️⃣  Faça login com o novo usuário criado:
-       👤 Usuário : {report['new_user'][0]}
-       🔑 (senha definida durante a conversão)""")
-
-    print(f'\n{SEP2}')
-    print(f'  ✅ Migração concluída com sucesso!')
-    print(f'{SEP2}\n')
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='Converte config.xml do pfSense para OPNsense (Dnsmasq DHCP)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemplos:
-  python3 pfsense2opnsense.py -i config-pfSense.xml
-  python3 pfsense2opnsense.py -i config-pfSense.xml --new-user
-  python3 pfsense2opnsense.py -i config-pfSense.xml --new-user \\
-      --username joao --fullname "João Silva" --password minhasenha
-        """
-    )
-    parser.add_argument('-i', '--input',   required=True,
-                        help='Arquivo de entrada (pfSense config.xml)')
-    parser.add_argument('-o', '--output',  default='config-opnsense.xml',
-                        help='Arquivo de saída (padrão: config-opnsense.xml)')
-    parser.add_argument('--new-user',      action='store_true',
-                        help='Criar novo usuário admin no OPNsense')
-    parser.add_argument('--username',      default='')
-    parser.add_argument('--fullname',      default='')
-    parser.add_argument('--password',      default='')
-    args = parser.parse_args()
-
-    if not HAS_BCRYPT and args.new_user:
-        print("[AVISO] 'bcrypt' não instalado. Rode: pip install bcrypt")
-
-    report = convert(
-        src=args.input, dst=args.output,
-        create_user=args.new_user, args=args
-    )
-
-    print_report(report, args.output)
-
-if __name__ == '__main__':
-    main()
+# pfsense2opnsense
 
+Conversor de backup de configuração do **pfSense** para **OPNsense**, com suporte a **Dnsmasq DNS & DHCP** e **remapeamento de interfaces físicas** para migração entre hardwares diferentes.
+
+> Migra hostname, domínio, DNS, interfaces, VLANs, reservas DHCP, ranges DHCP, rotas estáticas, gateways, aliases, regras de firewall e NAT — tudo em um único script Python sem dependências obrigatórias.
+
+---
+
+## Índice
+
+- [Por que este script?](#por-que-este-script)
+- [Requisitos](#requisitos)
+- [Instalação](#instalação)
+- [Uso rápido](#uso-rápido)
+- [Mapeamento de interfaces físicas](#mapeamento-de-interfaces-físicas)
+- [Criação de novo usuário admin](#criação-de-novo-usuário-admin)
+- [Importando no OPNsense](#importando-no-opnsense)
+- [O que é migrado](#o-que-é-migrado)
+- [O que NÃO é migrado](#o-que-não-é-migrado)
+- [Solução de problemas](#solução-de-problemas)
+- [Referência completa de opções](#referência-completa-de-opções)
+
+---
+
+## Por que este script?
+
+Migrar do pfSense para o OPNsense parece simples — os dois nasceram do mesmo código — mas na prática o XML mudou bastante. As principais dores são:
+
+- O OPNsense moderno usa **Dnsmasq DNS & DHCP** como serviço unificado, com schema diferente do `<dhcpd>` do pfSense.
+- Em **nova máquina**, as placas de rede mudam de nome (`em0` → `vtnet0`, `igb0` → `vmx0`...), e isso quebra interfaces, VLANs, regras de firewall, gateways etc.
+- O hash de senha do pfSense (`$2y$`) não é aceito direto pelo OPNsense (`$2b$`).
+- Itens como certificados, OpenVPN e IPsec precisam ser recriados manualmente.
+
+Este script automatiza tudo que dá para automatizar e lista no relatório final o que sobrou para você ajustar à mão.
+
+---
+
+## Requisitos
+
+- **Python 3.7+** (usa apenas a stdlib para o trabalho principal).
+- **`bcrypt`** *(opcional)* — necessário apenas se você for usar `--new-user` para criar um usuário admin extra no OPNsense.
+
+```bash
+pip install bcrypt
+```
+
+Se o `bcrypt` não estiver instalado e você usar `--new-user`, o script ainda gera o XML, mas a senha do novo usuário precisará ser redefinida manualmente após o primeiro login.
+
+---
+
+## Instalação
+
+Não há instalação — é um script único, sem dependências obrigatórias. Basta baixar:
+
+```bash
+curl -O https://exemplo.com/pfsense2opnsense.py
+chmod +x pfsense2opnsense.py
+```
+
+Ou clonar o repositório e usar `python3 pfsense2opnsense.py` diretamente.
+
+---
+
+## Uso rápido
+
+### 1. Conversão simples (mesmo hardware)
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml
+```
+
+Gera `config-opnsense.xml` no diretório atual. Sem o flag `--keep-interfaces`, o script vai perguntar interativamente sobre cada interface física (veja a [seção abaixo](#mapeamento-de-interfaces-físicas)).
+
+### 2. Mantendo os mesmos nomes de interface (sem prompt)
+
+Quando o hardware é igual (ou você vai mover o disco para outra máquina com as mesmas placas):
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml --keep-interfaces
+```
+
+### 3. Especificando arquivo de saída
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml -o /tmp/opnsense-novo.xml
+```
+
+---
+
+## Mapeamento de interfaces físicas
+
+**Esta é a parte mais importante quando você troca de máquina.** Em um hardware novo, as placas de rede vão ter nomes diferentes:
+
+| pfSense (antigo) | Possível nome na OPNsense (novo) |
+|---|---|
+| `em0`, `em1` (Intel) | `vtnet0`, `vtnet1` (VirtIO/Proxmox), `vmx0`, `vmx1` (VMware) |
+| `igb0`, `igb1` (Intel I-series) | `re0`, `re1` (Realtek), `bge0` (Broadcom) |
+| `bce0` | `ix0` (Intel 10G) |
+
+Você tem **três formas** de informar o mapeamento ao script:
+
+### Modo A — Interativo (padrão)
+
+Apenas rode o script e ele vai listar cada interface física com seu contexto (LAN/WAN, IP, descrição) e pedir o novo nome:
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml
+```
+
+Saída exemplo:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  🔌  MAPEAMENTO DE INTERFACES FÍSICAS                      │
+└────────────────────────────────────────────────────────────┘
+
+  🔹 em0
+     WAN  [Internet]  dhcp
+     Novo nome na OPNsense [em0]: vtnet0
+
+  🔹 em1
+     LAN  [Rede Interna]  192.168.1.1/24
+     Novo nome na OPNsense [em1]: vtnet1
+
+  Resumo do mapeamento:
+    em0  →  vtnet0
+    em1  →  vtnet1
+
+  Confirma o mapeamento? [S/n]:
+```
+
+Pressione **ENTER** para manter o mesmo nome de uma interface específica.
+
+### Modo B — Linha de comando (`--map`)
+
+Bom para automação ou quando você já sabe o mapeamento:
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml \
+    --map em0=vtnet0,em1=vtnet1,igb0=vmx0
+```
+
+O script não pergunta nada se todas as interfaces estiverem cobertas.
+
+### Modo C — Manter tudo (`--keep-interfaces`)
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml --keep-interfaces
+```
+
+### Como descobrir os nomes na nova máquina
+
+Antes de rodar o script, instale o OPNsense na máquina nova com configuração mínima e, no **console** (menu opção 8 - Shell) ou via SSH:
+
+```bash
+# Lista todas as interfaces
+ifconfig -l
+
+# Detalhes de uma interface específica (MAC, link, velocidade)
+ifconfig vtnet0
+```
+
+Anote os nomes (`vtnet0`, `vtnet1`...) e correlacione com os MACs das placas físicas. Depois rode o script com esse mapeamento.
+
+> **Dica:** as VLANs são remapeadas automaticamente. Se você tinha `em2.20` no pfSense e mapear `em2 → vtnet2`, o script gera `vtnet2.20` em todos os lugares (interfaces, VLANs, vlanif).
+
+---
+
+## Criação de novo usuário admin
+
+Por segurança, é boa prática criar um usuário admin extra além do `root` (que herda a senha do pfSense):
+
+### Interativo
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml --new-user
+```
+
+O script vai pedir nome de usuário, nome completo e senha.
+
+### Não-interativo (cuidado com histórico do shell!)
+
+```bash
+python3 pfsense2opnsense.py -i config-pfSense.xml --new-user \
+    --username joao \
+    --fullname "João Silva" \
+    --password 'senha-super-secreta'
+```
+
+> ⚠️ Senhas em linha de comando ficam no histórico do shell. Em produção, prefira o modo interativo ou use variáveis de ambiente lidas pelo seu wrapper.
+
+O novo usuário é criado no grupo `admins` com acesso total ao WebConfigurator (privilégio `page-all`).
+
+---
+
+## Importando no OPNsense
+
+Depois que o script gerar o `config-opnsense.xml`:
+
+1. Instale o OPNsense na máquina nova (configuração mínima — pode usar a opção *Quick Install*).
+2. Acesse a interface web: `https://<ip-do-opnsense>` (login `root` com a senha definida na instalação).
+3. Vá em **System → Configuration → Backups**.
+4. Em **Restore Backup**, clique em **Choose File** e selecione o XML gerado.
+5. Clique em **Restore Configuration**.
+6. O OPNsense vai reiniciar automaticamente. Aguarde ~1 minuto.
+7. Faça login novamente — agora a senha do `root` será a mesma do pfSense original, e seu novo usuário (se criado) também estará disponível.
+
+### Verificações pós-importação
+
+Confira em cada menu se tudo veio certo:
+
+| Item | Onde verificar |
+|---|---|
+| 🔌 Interfaces | Interfaces → Overview |
+| 🏮 VLANs | Interfaces → Other Types → VLAN |
+| 📡 DHCP ranges | Services → Dnsmasq DNS & DHCP → DHCP ranges |
+| 📋 Reservas DHCP | Services → Dnsmasq DNS & DHCP → Hosts |
+| 🛡️ Firewall | Firewall → Rules |
+| 🏷️ Aliases | Firewall → Aliases |
+| 🗺️ Rotas estáticas | System → Routes → Configuration |
+| 🚪 Gateways | System → Gateways → Single |
+
+---
+
+## O que é migrado
+
+✅ **Sistema** — hostname, domínio, timezone, servidores DNS, NTP, senha do root (com conversão de hash `$2y$` → `$2b$`).
+✅ **Interfaces** — todas as interfaces lógicas (WAN, LAN, OPT1, OPT2...) com IP, máscara, descrição, IPv6.
+✅ **VLANs** — com mapeamento automático do nome da interface pai.
+✅ **DHCP** — ranges e reservas estáticas, migradas para o novo serviço **Dnsmasq DNS & DHCP**.
+✅ **Rotas estáticas** e **gateways**.
+✅ **Aliases** de firewall (hosts, redes, portas).
+✅ **Regras de firewall** (filter rules) com origem, destino, protocolo, portas.
+✅ **NAT** (port forwards básicos).
+✅ **Bloqueio de bogons/RFC1918 na WAN** (configurado automaticamente).
+
+---
+
+## O que NÃO é migrado
+
+⚠️ Algumas coisas precisam de recriação manual no OPNsense por diferenças estruturais entre os dois projetos:
+
+- 🔐 **Certificados SSL/CA/PKI** — recrie em System → Trust → Certificates.
+- 🌐 **OpenVPN servidor e cliente** — recrie em VPN → OpenVPN.
+- 🔒 **IPsec** (túneis fase 1 e 2) — recrie em VPN → IPsec.
+- 🚪 **Captive Portal** — recrie em Services → Captive Portal.
+- 📦 **Pacotes instalados** (Suricata, pfBlockerNG, HAProxy etc.) — instale os equivalentes em System → Firmware → Plugins.
+- 📊 **Configurações de monitoring/RRD** e estatísticas históricas.
+
+O script lista no relatório final tudo que detectou no pfSense e não conseguiu migrar, para você ter a checklist em mãos.
+
+---
+
+## Solução de problemas
+
+### "ImportError: No module named bcrypt"
+
+Você está usando `--new-user` sem ter o `bcrypt` instalado. Rode:
+```bash
+pip install bcrypt
+```
+Ou então remova `--new-user` e crie o usuário manualmente depois pela interface web.
+
+### Após importar, perdi acesso à interface web
+
+Isso quase sempre é problema de **mapeamento de interfaces**. Conecte um monitor e teclado à máquina e veja, pelo menu do OPNsense, qual interface está como LAN. Se estiver na placa errada, use a opção **1) Assign interfaces** do menu console para corrigir, ou refaça a conversão com o `--map` correto.
+
+### As VLANs não aparecem
+
+Verifique se a interface pai (no exemplo, `vtnet2` se você usou `--map em2=vtnet2`) realmente existe na máquina nova. Sem o pai físico, as VLANs filhas não sobem.
+
+### Erro "Cannot parse XML"
+
+O backup do pfSense pode estar corrompido ou ter sido editado manualmente. Tente gerar um novo backup em **Diagnostics → Backup & Restore** no pfSense original e use esse.
+
+### Reservas DHCP funcionam mas resolução de nomes não
+
+O Dnsmasq DNS & DHCP precisa estar ativado em **Services → Dnsmasq DNS & DHCP → General** e a interface LAN precisa estar listada como "interface" — o script já faz isso, mas vale conferir.
+
+---
+
+## Referência completa de opções
+
+```
+python3 pfsense2opnsense.py [opções]
+
+OPÇÕES OBRIGATÓRIAS
+  -i, --input ARQUIVO       Arquivo de entrada (config.xml do pfSense)
+
+OPÇÕES GERAIS
+  -o, --output ARQUIVO      Arquivo de saída (padrão: config-opnsense.xml)
+  -h, --help                Exibe a ajuda
+
+MAPEAMENTO DE INTERFACES
+  --map em0=vtnet0,em1=vtnet1
+                            Mapeia nomes físicos antigos → novos
+  --keep-interfaces         Mantém os nomes originais sem prompt
+
+CRIAÇÃO DE USUÁRIO ADMIN
+  --new-user                Cria um usuário admin adicional
+  --username NOME           Nome de usuário (padrão: admin2)
+  --fullname "NOME COMPLETO" Nome completo
+  --password SENHA          Senha (não recomendado em CLI — use modo interativo)
+```
+
+---
+
+## Exemplos completos
+
+**Cenário 1 — Migração simples, mesmo hardware:**
+```bash
+python3 pfsense2opnsense.py -i pfsense-backup.xml --keep-interfaces
+```
+
+**Cenário 2 — Migração para nova máquina virtual (Proxmox/VirtIO):**
+```bash
+python3 pfsense2opnsense.py \
+    -i pfsense-backup.xml \
+    -o opnsense.xml \
+    --map em0=vtnet0,em1=vtnet1,em2=vtnet2 \
+    --new-user --username admin2 --fullname "Admin Backup"
+```
+
+**Cenário 3 — Migração interativa completa:**
+```bash
+python3 pfsense2opnsense.py -i pfsense-backup.xml --new-user
+# (responde aos prompts de mapeamento e usuário)
+```
+
+---
+
+## Licença
+
+Use à vontade. Faça backup antes de testar em produção. Não há garantia: revise o XML gerado antes de importar em ambiente crítico.
